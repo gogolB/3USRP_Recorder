@@ -1,5 +1,9 @@
 #include <stdio.h>
+
+// UHD stuff
 #include <uhd.h>
+#include <uhd/usrp/multi_usrp.hpp>
+#include <uhd/types/device_addr.hpp>
 
 
 // Parsing the INI File
@@ -31,6 +35,22 @@ double centerfrq1;
 std::string devaddr2;
 std::string filename2;
 double centerfrq2;
+
+
+// Multi USRP sptr;
+uhd::usrp::multi_usrp::sptr dev;
+
+void createUSRPs(void)
+{
+	// Preping to create the multi USRP
+	uhd::device_addr_t dev_addr;
+	
+	dev_addr["addr0"] = devaddr0;
+	dev_addr["addr1"] = devaddr1;
+	dev_addr["addr2"] = devaddr2;
+
+	dev = uhd::usrp::multi_usrp::make(dev_addr);
+}
 
 int main(int argc, char ** argv)
 {

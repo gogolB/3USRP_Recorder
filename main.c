@@ -4,6 +4,8 @@
 #include <uhd.h>
 #include <uhd/usrp/multi_usrp.hpp>
 #include <uhd/types/device_addr.hpp>
+#include <uhd/types/tune_request.hpp>
+#include <uhd/usrp/subdev_spec.hpp>
 
 
 // Parsing the INI File
@@ -48,8 +50,37 @@ void createUSRPs(void)
 	dev_addr["addr0"] = devaddr0;
 	dev_addr["addr1"] = devaddr1;
 	dev_addr["addr2"] = devaddr2;
-
+	
+	// Create the Multi USRP
 	dev = uhd::usrp::multi_usrp::make(dev_addr);
+
+	// Set all the subdevs
+
+	uhd::usrp::subdev_spec_t subdev("A:A");
+
+	dev->set_rx_subdev_spec(subdev,0);
+	dev->set_rx_subdev_spec(subdev,1);
+	dev->set_rx_subdev_spec(subdev,2);
+
+	// Make sure the clock source is external
+	dev->set_clock_source("external");
+
+	// Set the sample rate please note that I am scaling up the double
+	// this means that the samplerate in the config file should be in Msps.
+	dev->set_rx_rate(sampleRate*1e6);
+
+	// Set the center freq
+	uhd::tune_request_t tune_request0(centerfrq0*1e6);
+	dev->set_rx_freq(tune_request0,0);
+	
+	uhd::tune_request_t tune_request1(centerfrq1*1e6);
+	dev->set_rx_freq(tune_request1,1);
+	
+	uhd::tune_request_t tune_request2(centerfrq2*1e6);
+	dev->set_rx_freq(tune_request2,2);
+
+	// Set the gains
+	dev->set_rx_gain(gain,uhd::usrp::multi_usrp::ALL_CHANS);
 }
 
 int main(int argc, char ** argv)

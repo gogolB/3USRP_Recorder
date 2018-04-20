@@ -96,29 +96,7 @@ void createUSRPs(void)
 	dev->set_rx_gain(gain,uhd::usrp::multi_usrp::ALL_CHANS);
 }
 
-void setupStreaming(void) {
-	// For external clock source, set time
-	dev->set_time_unknown_pps(uhd::time_spec_t(0.0));
-	boost::this_thread::sleep(boost::chrono::seconds(1)); // Wait for pps sync pulse
-
-	// Create a receive streamer
-	uhd::stream_args_t stream_args("fc32"); //complex floats
-	stream_args.channels = 0;
-	uhd::rx_streamer::sptr rx_stream = dev->get_rx_stream(stream_args);
-
-	// Setup streaming
-	printf("\nBegin streaming %d samples...\n", total_num_samps);
-	uhd::stream_cmd_t stream_cmd((total_num_samps == 0) ?
-		uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS :
-		uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE
-   );
-   stream_cmd.num_samps = total_num_samps;
-	stream_cmd.stream_now = true;
-	stream_cmd.time_spec = uhd::time_spec_t();
-	rx_stream->issue_stream_cmd(stream_cmd); 
-}
-
-void write_to_file_thread(const std::string &file, moodycamel::BlockingReaderWriterQueue<std::complex<float> > &q) {
+void write_to_file_thread(const std::string file, moodycamel::BlockingReaderWriterQueue<std::complex<float> > &q) {
 	std::ofstream outfile;
 	outfile.open(file.c_str(), std::ofstream::binary);
 	std::complex<float> data;
@@ -183,7 +161,29 @@ int main(int argc, char ** argv)
 
 
 	// Setup rx streamer
-	setupStreaming();
+	// For external clock source, set time
+	dev->set_time_unknown_pps(uhd::time_spec_t(0.0));
+	boost::this_thread::sleep(boost::chrono::seconds(1)); // Wait for pps sync pulse
+
+	// Create a receive streamer
+	uhd::stream_args_t stream_args("fc32"); //complex floats
+	stream_args.channels = 0;
+	uhd::rx_streamer::sptr rx_stream = dev->get_rx_stream(stream_args);
+
+	// Setup streaming
+	printf("\nBegin streaming %d samples...\n", total_num_samps);
+	uhd::stream_cmd_t stream_cmd((total_num_samps == 0) ?
+		uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS :
+		uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE
+   );
+   stream_cmd.num_samps = total_num_samps;
+	stream_cmd.stream_now = true;
+	stream_cmd.time_spec = uhd::time_spec_t();
+	rx_stream->issue_stream_cmd(stream_cmd); 
+	if (total_num_samps == 0) {
+		std::signal(SIGINT, &sig_int_handler);
+		printf("Press Ctrl + C to stop streaming...\n");
+	}
 
 	// Allocate buffers to receive with samples (one buffer per channel)
 	const size_t samps_per_buff = rx_stream->get_max_num_samps();
@@ -201,9 +201,10 @@ int main(int argc, char ** argv)
 	moodycamel::BlockingReaderWriterQueue<std::complex<float> > q1;
 	moodycamel::BlockingReaderWriterQueue<std::complex<float> > q2;
 
-	boost::thread r0(write_to_file_thread(), filepath + filename0, q0);
-	boost::thread r1(write_to_file_thread(), filepath + filename1, q1);
-	boost::thread r2(write_to_file_thread(), filepath + filename2, q2);
+	// Consumer threads
+	boost::thread c0(write_to_file_thread, filepath + filename0, q0);
+	boost::thread c1(write_to_file_thread, filepath + filename1, q1);
+	boost::thread c2(write_to_file_thread, filepath + filename2, q2);
 
 	// Streaming loop
 	size_t num_acc_samps = 0; //number of accumulated samples
@@ -231,20 +232,19 @@ int main(int argc, char ** argv)
 			}
 			continue;
 		}
-		if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE){
-			std::string error = str(boost::format("Receiver error: %s") % md.strerror());
-			perror("%s\n", error);
+		if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
+			printf("Receiver error: %s\n", md.strerror().c_str());
       }
 		num_acc_samps += num_rx_samps;
 	}
 
-	if (num_acc_samps < total_num_samps) {
-		perror("Receive timeout or stop signal called before all samples received...\n");
+	if (num_acc_samps < total_num_samps && !stop_signal_called) {
+		printf("Received timeout before all samples received...\n");
 	}
 
-	r1.join();
-	r2.join();
-	r3.join();
+	c1.join();
+	c2.join();
+	c3.join();
 
 	// Finished
 	printf("\nDone!\n\n");

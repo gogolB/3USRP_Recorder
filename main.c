@@ -12,8 +12,17 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/ini_parser.hpp>
 
+#include <boost/chrono.hpp>
+#include <boost/thread/thread.hpp>
 
 #include <string>
+#include <complex>
+#include <csignal>
+
+// Moodycamel SPSC lock-less queue
+#include "readerwriterqueue.h"
+#include "atomicops.h"
+
 
 // Global Vars
 boost::property_tree::ptree pt;
@@ -24,6 +33,7 @@ std::string filepath;
 // Usrp Global props
 double sampleRate;
 double gain;
+int total_num_samps;
 
 // USRP 0 Params
 std::string devaddr0;
@@ -41,6 +51,9 @@ double centerfrq2;
 
 // Multi USRP sptr;
 uhd::usrp::multi_usrp::sptr dev;
+
+static bool stop_signal_called = false;
+void sig_int_handler(int){stop_signal_called = true;}
 
 void createUSRPs(void)
 {
@@ -83,6 +96,45 @@ void createUSRPs(void)
 	dev->set_rx_gain(gain,uhd::usrp::multi_usrp::ALL_CHANS);
 }
 
+void setupStreaming(void) {
+	// For external clock source, set time
+	dev->set_time_unknown_pps(uhd::time_spec_t(0.0));
+	boost::this_thread::sleep(boost::chrono::seconds(1)); // Wait for pps sync pulse
+
+	// Create a receive streamer
+	uhd::stream_args_t stream_args("fc32"); //complex floats
+	stream_args.channels = 0;
+	uhd::rx_streamer::sptr rx_stream = dev->get_rx_stream(stream_args);
+
+	// Setup streaming
+	printf("\nBegin streaming %d samples...\n", total_num_samps);
+	uhd::stream_cmd_t stream_cmd((total_num_samps == 0) ?
+		uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS :
+		uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE
+   );
+   stream_cmd.num_samps = total_num_samps;
+	stream_cmd.stream_now = true;
+	stream_cmd.time_spec = uhd::time_spec_t();
+	rx_stream->issue_stream_cmd(stream_cmd); 
+}
+
+void write_to_file_thread(const std::string &file, moodycamel::BlockingReaderWriterQueue<std::complex<float> > &q) {
+	std::ofstream outfile;
+	outfile.open(file.c_str(), std::ofstream::binary);
+	std::complex<float> data;
+	if (outfile.is_open()) {
+		q.wait_dequeue(data);
+		outfile.write((const char*)&data, sizeof(data));
+		while (q.try_dequeue(data)) {
+			outfile.write((const char*)&data, sizeof(data));
+		}
+		printf("File %s written!\n", file.c_str());
+	}
+	else {
+		printf("File %s failed to open.\n", file.c_str());
+	}
+}
+
 int main(int argc, char ** argv)
 {
 	if(argc < 2)
@@ -101,6 +153,8 @@ int main(int argc, char ** argv)
 	filepath = pt.get<std::string>("Global.filepath");
 	sampleRate = std::stod(pt.get<std::string>("Global.samplerate"));
 	gain = std::stod(pt.get<std::string>("Global.gain"));
+	total_num_samps = std::stoi(pt.get<std::string>("Global.total_num_samps"));
+	sync = pt.get<std::string>("Global.sync"); // "now", "pps", or "mimo"
 
 	printf("All files will be stored in directory %s.\nSample Rate is %0.2f MSps\nUSRP Gain is %fdB\n",filepath.c_str(), sampleRate, gain);
 	
@@ -126,4 +180,74 @@ int main(int argc, char ** argv)
 	centerfrq2 = std::stod(pt.get<std::string>("USRP2.centerfrq"));
 
 	printf("Using USRP [%s] to record to %s%s with a center frq of %0.2f Mhz\n",devaddr2.c_str(), filepath.c_str(),filename2.c_str(), centerfrq2);
+
+
+	// Setup rx streamer
+	setupStreaming();
+
+	// Allocate buffers to receive with samples (one buffer per channel)
+	const size_t samps_per_buff = rx_stream->get_max_num_samps();
+	std::vector<std::vector<std::complex<float> > > buffs(
+		dev->get_rx_num_channels(), std::vector<std::complex<float> >(samps_per_buff)
+	);
+
+	// Create a vector of pointers to point to each of the channel buffers
+	std::vector<std::complex<float> *> buff_ptrs;
+	for (size_t i = 0; i < buffs.size(); i++) {
+		buff_ptrs.push_back(&buffs[i].front());
+	}
+
+	moodycamel::BlockingReaderWriterQueue<std::complex<float> > q0;
+	moodycamel::BlockingReaderWriterQueue<std::complex<float> > q1;
+	moodycamel::BlockingReaderWriterQueue<std::complex<float> > q2;
+
+	boost::thread r0(write_to_file_thread(), filepath + filename0, q0);
+	boost::thread r1(write_to_file_thread(), filepath + filename1, q1);
+	boost::thread r2(write_to_file_thread(), filepath + filename2, q2);
+
+	// Streaming loop
+	size_t num_acc_samps = 0; //number of accumulated samples
+	bool overflow_message = true;
+
+	while (!stop_signal_called && (num_acc_samps < total_num_samps)) {
+		size_t num_rx_samps = rx_stream->recv(
+			buff_ptrs, samps_per_buff, md
+		);
+
+		// Handle the error code
+		if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) {
+			printf("Timeout while streaming\n");
+			break;
+		}
+		if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+			if (overflow_message) {
+				overflow_message = false;
+				std::cerr << boost::format(
+					"Got an overflow indication. Please consider the following:\n"
+					"  Your write medium must sustain a rate of %fMB/s.\n"
+					"  Dropped samples will not be written to the file.\n"
+					"  This message will not appear again.\n"
+				) % (dev->get_rx_rate()*sizeof(std::complex<float>)/1e6);
+			}
+			continue;
+		}
+		if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE){
+			std::string error = str(boost::format("Receiver error: %s") % md.strerror());
+			perror("%s\n", error);
+      }
+		num_acc_samps += num_rx_samps;
+	}
+
+	if (num_acc_samps < total_num_samps) {
+		perror("Receive timeout or stop signal called before all samples received...\n");
+	}
+
+	r1.join();
+	r2.join();
+	r3.join();
+
+	// Finished
+	printf("\nDone!\n\n");
+
+	return EXIT_SUCCESS;
 }
